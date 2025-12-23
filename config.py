@@ -14,7 +14,8 @@ class TrainingConfig:
     train_iters: int = 10
     batch_size: int = 16
     render_test: bool = False
-    policy_target: str = "td_error"
+    policy_target: str = "return"
+    use_adv_normalizer: bool = False
     use_clip: bool = False
     clip_ratio: float = 0.2
     save_root: str | Path = "/data/seek/rl_rundata/logs_ac"

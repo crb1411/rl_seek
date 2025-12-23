@@ -6,12 +6,12 @@ class ActorCritic(nn.Module):
     def __init__(self, obs_dim, act_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, 64), nn.Tanh(),
-            nn.Linear(64, 64), nn.Tanh()
+            nn.Linear(obs_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU()
         )
         self.net_value = nn.Sequential(
-            nn.Linear(obs_dim, 64), nn.Tanh(),
-            nn.Linear(64, 64), nn.Tanh()
+            nn.Linear(obs_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU()
         )
         self.policy_head = nn.Linear(64, act_dim)
         self.value_head = nn.Linear(64, 1)

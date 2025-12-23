@@ -5,7 +5,7 @@ from typing import Optional
 class AdvantageNormalizer:
     """Running mean/std (EMA) for advantage normalization."""
 
-    def __init__(self, momentum: float = 0.98, eps: float = 1e-8, device: Optional[torch.device] = None):
+    def __init__(self, momentum: float = 0.4, eps: float = 1e-8, device: Optional[torch.device] = None):
         self.momentum = momentum
         self.eps = eps
         self.device = device

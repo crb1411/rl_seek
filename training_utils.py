@@ -26,6 +26,7 @@ def init_wandb(enable: bool, save_root: Path, config: dict, run_name: Optional[s
         id=resume_id,
         resume="allow" if resume_id else None,
         config=config,
+        reinit=True
     )
 
 

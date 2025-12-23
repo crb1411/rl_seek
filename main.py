@@ -6,22 +6,18 @@ import numpy as np
 from pathlib import Path
 from dataclasses import asdict
 from typing import List, Optional
+import logging
 
 from advantage_normalizer import AdvantageNormalizer
 from models import ActorCritic
 from training_utils import init_wandb, save_checkpoint, load_checkpoint
 from inference import evaluate_policy
 from config import TrainingConfig
+from utils import creat_subdir, format_rollout_log_str, format_head_tail, setup_logger
 
-def format_head_tail(values: List[float], n: int = 5) -> str:
-    """Return first/last n values (ellipsis in the middle if truncated)."""
-    if not values:
-        return "[]"
-    if len(values) <= 2 * n:
-        parts = [f"{v:.3f}" for v in values]
-    else:
-        parts = [f"{v:.3f}" for v in values[:n]] + ["..."] + [f"{v:.3f}" for v in values[-n:]]
-    return "[" + ", ".join(parts) + "]"
+logger = logging.getLogger("rl.training")
+
+
 
 
 def select_device(pref: str) -> torch.device:
@@ -152,7 +148,7 @@ def ppo_train(config: TrainingConfig):
     device = select_device(config.device)
     ac = ActorCritic(obs_dim, act_dim).to(device)
     optimizer = optim.Adam(ac.parameters(), lr=config.pi_lr)
-    adv_normalizer = AdvantageNormalizer()
+    adv_normalizer = AdvantageNormalizer(momentum=0) # 等于 0 退化成不参考历史的 mean, std
     training_config = asdict(config)
     training_config["save_root"] = str(save_root)
     training_config["checkpoint_dir"] = str(checkpoint_dir)
@@ -165,33 +161,32 @@ def ppo_train(config: TrainingConfig):
     buf = RolloutBuffer(config.steps_per_epoch + env_max_steps, obs_dim, normalizer=adv_normalizer)
 
     start_epoch = 0
+    run = None
     if resume_path and resume_path.exists():
         last_epoch, _ = load_checkpoint(resume_path, ac, optimizer, adv_normalizer)
         start_epoch = last_epoch + 1
-        print(f"Resumed from {resume_path}, starting at epoch {start_epoch}")
+        logger.info(f"Resumed from {resume_path}, starting at epoch {start_epoch}")
     elif resume_path:
-        print(f"Resume path {resume_path} not found. Starting fresh.")
+        logger.info(f"Resume path {resume_path} not found. Starting fresh.")
     else:
-        print("Starting fresh.")
+        logger.info("Starting fresh.")
 
-        run = init_wandb(
-            config.use_wandb,
-            save_root=save_root,
-            config=training_config,
-            run_name=config.run_name,
-            resume_id=(resume_path.stem + "_train") if resume_path else None,
-            entity=config.wandb_entity,
-            project=config.wandb_project,
-        )
-        
-        run_rollout = init_wandb(
-            config.use_wandb,
-            save_root=save_root,
-            run_name=config.run_name + "_rollout",
-            resume_id=(resume_path.stem + "_rollout") if resume_path else None,
-            entity=config.wandb_entity,
-            project=config.wandb_project,
-        )
+    # =========================
+    # Train run
+    # =========================
+    base_name = config.run_name or "train"
+
+    run = init_wandb(
+        config.use_wandb,
+        save_root=save_root,
+        config=training_config,
+        run_name=base_name,
+        resume_id=(resume_path.stem + "_train") if resume_path else None,
+        entity=config.wandb_entity,
+        project=config.wandb_project,
+    )
+
+    logger.info(f"[wandb] train run   : {base_name}")
 
     for epoch in range(start_epoch, config.epochs):
         buf.reset()
@@ -215,13 +210,33 @@ def ppo_train(config: TrainingConfig):
         # 采样完成，计算G_list
         buf.finish_path(gamma=config.gamma, lam=config.lam, strategy=config.policy_target)
         
-        if run_rollout is not None:
-            run_rollout.log(
-                {
-                    
-                }
-            )
+        if run is not None:
+            first_done_indices = np.where(buf.dones[:buf.ptr] > 0)[0]
+            if first_done_indices.size > 0:
+                first_end = int(first_done_indices[0])
+            else:
+                first_end = min(buf.ptr, 10) - 1
+            first_end = max(first_end, -1)
+            first_slice = slice(0, first_end + 1)
+            first_len = first_slice.stop - first_slice.start
 
+            episodes = int(np.count_nonzero(buf.dones[:buf.ptr]))
+            episodes = max(episodes, 1)
+            rollout_log = {
+                "rollout/epoch": epoch + 1,
+                "rollout/steps": int(buf.ptr),
+                "rollout/episodes": episodes,
+                "rollout/avg_steps_per_episode": float(buf.ptr / episodes),
+                "rollout/first_episode_len": int(first_len),
+                "rollout/first_values": format_head_tail(buf.values[first_slice].tolist()),
+                "rollout/first_returns": format_head_tail(buf.returns[first_slice].tolist()),
+                "rollout/first_advantages": format_head_tail(buf.advantages[first_slice].tolist()),
+            }
+            logger.info(format_rollout_log_str(rollout_log))
+            # run.log(
+            #     rollout_log
+            # )
+            
         # 开始训练（使用 -log_prob * G_list 或 PPO-Clip）
         obs_buf, act_buf, logp_buf, ret_buf, advantages_buf = buf.get()
         obs_buf = obs_buf.to(device)
@@ -248,7 +263,7 @@ def ppo_train(config: TrainingConfig):
                     unclipped = ratio * advantages_buf[mb_idx]
                     clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * advantages_buf[mb_idx]
                     policy_loss = -torch.min(unclipped, clipped).mean()
-                    print(f'ratio: {ratio.mean().item()}')
+                    # logger.info(f'ratio: {ratio.mean().item()}')
                 else:
                     policy_loss = -(logp * advantages_buf[mb_idx]).mean()
                 critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
@@ -271,10 +286,9 @@ def ppo_train(config: TrainingConfig):
         current_value_loss = epoch_value_losses[-1] if epoch_value_losses else 0.0
         current_entropy = epoch_entropies[-1] if epoch_entropies else 0.0
         current_epoch = epoch + 1
-        print(
+        logger.info(
             f"Epoch {current_epoch}: TestReward={test_reward:.1f}\n"
-            f"pi_loss={current_policy_loss:.4f} vf_loss={current_value_loss:.4f} ent={current_entropy:.4f}\n"
-            f"mean_pi_loss={mean_policy_loss:.4f} mean_vf_loss={mean_value_loss:.4f} mean_ent={mean_entropy:.4f}\n\n"
+            f"pi_loss={current_policy_loss:.4f} vf_loss={current_value_loss:.4f} ent={current_entropy:.4f}\n\n"
         )
 
         save_checkpoint(checkpoint_dir / "latest.pt", ac, optimizer, adv_normalizer, epoch, training_config)
@@ -299,18 +313,21 @@ if __name__ == "__main__":
     train_config = TrainingConfig(
                         epochs=100,
                         use_wandb=True,
+                        train_iters=10,
+                        use_clip=True,
                     )
     save_root = train_config.save_root if train_config.save_root else "/mnt/seek/rundata/1223"
-    from utils import creat_subdir
+    
     train_config.save_root = creat_subdir(
                                 base_dir=save_root, 
                                 prefix=f"{TrainingConfig.policy_target}", 
                                 create=True,
                                 time=True,
                             )
-    train_config.run_name = f"{train_config.policy_target}_with_clip" if train_config.use_clip else f"{train_config.policy_target}_no_clip"
+    train_config.run_name = f"{train_config.policy_target}_with_clip_{train_config.save_root[-9:]}" if train_config.use_clip else f"{train_config.policy_target}_no_clip_{train_config.save_root[-9:]}"
     train_config.checkpoint_dir = os.path.join(train_config.save_root, "checkpoints")
-    print(train_config)
+    logger = setup_logger(name='rl.training', log_dir=train_config.save_root, filename='training.log')
+    logger.info(train_config)
     ppo_train(train_config)   # 可调大epochs训练更好
     # 推理展示（训练结束后手动调用）
     # env = gym.make("CartPole-v1", render_mode='human')
