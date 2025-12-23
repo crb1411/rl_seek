@@ -5,12 +5,23 @@ import torch.optim as optim
 import numpy as np
 from pathlib import Path
 from dataclasses import asdict
+from typing import List, Optional
 
 from advantage_normalizer import AdvantageNormalizer
 from models import ActorCritic
 from training_utils import init_wandb, save_checkpoint, load_checkpoint
 from inference import evaluate_policy
 from config import TrainingConfig
+
+def format_head_tail(values: List[float], n: int = 5) -> str:
+    """Return first/last n values (ellipsis in the middle if truncated)."""
+    if not values:
+        return "[]"
+    if len(values) <= 2 * n:
+        parts = [f"{v:.3f}" for v in values]
+    else:
+        parts = [f"{v:.3f}" for v in values[:n]] + ["..."] + [f"{v:.3f}" for v in values[-n:]]
+    return "[" + ", ".join(parts) + "]"
 
 
 def select_device(pref: str) -> torch.device:
@@ -163,15 +174,24 @@ def ppo_train(config: TrainingConfig):
     else:
         print("Starting fresh.")
 
-    run = init_wandb(
-        config.use_wandb,
-        save_root=save_root,
-        config=training_config,
-        run_name=config.run_name,
-        resume_id=resume_path.stem if resume_path else None,
-        entity=config.wandb_entity,
-        project=config.wandb_project,
-    )
+        run = init_wandb(
+            config.use_wandb,
+            save_root=save_root,
+            config=training_config,
+            run_name=config.run_name,
+            resume_id=(resume_path.stem + "_train") if resume_path else None,
+            entity=config.wandb_entity,
+            project=config.wandb_project,
+        )
+        
+        run_rollout = init_wandb(
+            config.use_wandb,
+            save_root=save_root,
+            run_name=config.run_name + "_rollout",
+            resume_id=(resume_path.stem + "_rollout") if resume_path else None,
+            entity=config.wandb_entity,
+            project=config.wandb_project,
+        )
 
     for epoch in range(start_epoch, config.epochs):
         buf.reset()
@@ -194,14 +214,21 @@ def ppo_train(config: TrainingConfig):
                     break
         # 采样完成，计算G_list
         buf.finish_path(gamma=config.gamma, lam=config.lam, strategy=config.policy_target)
+        
+        if run_rollout is not None:
+            run_rollout.log(
+                {
+                    
+                }
+            )
 
         # 开始训练（使用 -log_prob * G_list 或 PPO-Clip）
-        obs_buf, act_buf, logp_buf, ret_buf, g_buf = buf.get()
+        obs_buf, act_buf, logp_buf, ret_buf, advantages_buf = buf.get()
         obs_buf = obs_buf.to(device)
         act_buf = act_buf.to(device)
         logp_buf = logp_buf.to(device)
         ret_buf = ret_buf.to(device)
-        g_buf = g_buf.to(device)
+        advantages_buf = advantages_buf.to(device)
         n = obs_buf.shape[0]
         idx = np.arange(n)
         epoch_policy_losses = []
@@ -218,11 +245,12 @@ def ppo_train(config: TrainingConfig):
                 )
                 if config.use_clip:
                     ratio = torch.exp(logp - logp_buf[mb_idx])
-                    unclipped = ratio * g_buf[mb_idx]
-                    clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * g_buf[mb_idx]
+                    unclipped = ratio * advantages_buf[mb_idx]
+                    clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * advantages_buf[mb_idx]
                     policy_loss = -torch.min(unclipped, clipped).mean()
+                    print(f'ratio: {ratio.mean().item()}')
                 else:
-                    policy_loss = -(logp * g_buf[mb_idx]).mean()
+                    policy_loss = -(logp * advantages_buf[mb_idx]).mean()
                 critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
                 entropy_coef = max(0.02 * (1 - epoch / config.epochs), 0.0)
                 loss = policy_loss + 0.5 * critic_loss - entropy_coef * entropy.mean()
@@ -231,17 +259,23 @@ def ppo_train(config: TrainingConfig):
                 loss.backward()
                 optimizer.step()
                 epoch_policy_losses.append(policy_loss.item())
-                epoch_value_losses.append(critic_loss.item())
-                epoch_entropies.append(entropy.mean().item())
+                epoch_value_losses.append(critic_loss.item() * 0.5)
+                epoch_entropies.append(entropy.mean().item() * entropy_coef)
 
         # 简单评估（每轮打印一次）
         test_reward = evaluate_policy(ac, env, render=config.render_test, device=device)
         mean_policy_loss = float(np.mean(epoch_policy_losses)) if epoch_policy_losses else 0.0
         mean_value_loss = float(np.mean(epoch_value_losses)) if epoch_value_losses else 0.0
         mean_entropy = float(np.mean(epoch_entropies)) if epoch_entropies else 0.0
+        current_policy_loss = epoch_policy_losses[-1] if epoch_policy_losses else 0.0
+        current_value_loss = epoch_value_losses[-1] if epoch_value_losses else 0.0
+        current_entropy = epoch_entropies[-1] if epoch_entropies else 0.0
         current_epoch = epoch + 1
-        print(f"Epoch {current_epoch}: TestReward={test_reward:.1f} "
-              f"pi_loss={mean_policy_loss:.4f} vf_loss={mean_value_loss:.4f} ent={mean_entropy:.4f}")
+        print(
+            f"Epoch {current_epoch}: TestReward={test_reward:.1f}\n"
+            f"pi_loss={current_policy_loss:.4f} vf_loss={current_value_loss:.4f} ent={current_entropy:.4f}\n"
+            f"mean_pi_loss={mean_policy_loss:.4f} mean_vf_loss={mean_value_loss:.4f} mean_ent={mean_entropy:.4f}\n\n"
+        )
 
         save_checkpoint(checkpoint_dir / "latest.pt", ac, optimizer, adv_normalizer, epoch, training_config)
         if config.checkpoint_freq > 0 and current_epoch % config.checkpoint_freq == 0:
@@ -252,9 +286,9 @@ def ppo_train(config: TrainingConfig):
             run.log({
                 "epoch": current_epoch,
                 "test_reward": test_reward,
-                "policy_loss": mean_policy_loss,
-                "value_loss": mean_value_loss,
-                "entropy": mean_entropy,
+                "policy_loss": current_policy_loss,
+                "value_loss": current_value_loss,
+                "entropy": current_entropy,
             })
 
     if run is not None:
