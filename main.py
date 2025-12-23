@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from advantage_normalizer import AdvantageNormalizer
 
 # --- 1. Actor-Critic 网络 ---
 class ActorCritic(nn.Module):
@@ -44,7 +45,7 @@ class ActorCritic(nn.Module):
 
 # --- 2. Rollout Buffer ---
 class RolloutBuffer:
-    def __init__(self, size, obs_dim):
+    def __init__(self, size, obs_dim, normalizer: AdvantageNormalizer | None = None):
         self.obs = np.zeros((size, obs_dim), np.float32)
         self.actions = np.zeros(size, np.int32)
         self.logprobs = np.zeros(size, np.float32)
@@ -56,6 +57,7 @@ class RolloutBuffer:
         self.returns = np.zeros(size, np.float32)
         self.ptr = 0
         self.max_size = size
+        self.normalizer = normalizer
 
     def store(self, obs, action, logp, reward, done, value, timeout=False):
         self.obs[self.ptr] = obs
@@ -85,7 +87,8 @@ class RolloutBuffer:
         for i in reversed(range(n)):
             if self.dones[i]:
                 if self.timeouts[i]:
-                    g_next = 1.0 / (1.0 - gamma)
+                    # g_next = 1.0 / (1.0 - gamma)
+                    g_next = (self.values[i] - 1.0) / gamma
                 else:
                     g_next = 0.0
 
@@ -123,6 +126,10 @@ class RolloutBuffer:
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
+        if self.normalizer is not None:
+            g_torch = torch.tensor(g_list, dtype=torch.float32)
+            g_list = self.normalizer.normalize(g_torch).cpu().numpy()
+
         self.advantages[:n] = g_list
 
     def get(self):
@@ -156,12 +163,13 @@ def ppo_train(env_name='CartPole-v1', steps_per_epoch=2000, epochs=50,
     act_dim = env.action_space.n
     ac = ActorCritic(obs_dim, act_dim)
     optimizer = optim.Adam(ac.parameters(), lr=pi_lr)
+    adv_normalizer = AdvantageNormalizer()
 
     valid_policy_targets = {"return", "advantage", "td_error", "ppo_gae"}
     if policy_target not in valid_policy_targets:
         raise ValueError(f"policy_target must be one of {valid_policy_targets}")
 
-    buf = RolloutBuffer(steps_per_epoch + env_max_steps, obs_dim)
+    buf = RolloutBuffer(steps_per_epoch + env_max_steps, obs_dim, normalizer=adv_normalizer)
 
     for epoch in range(epochs):
         buf.reset()
@@ -206,7 +214,9 @@ def ppo_train(env_name='CartPole-v1', steps_per_epoch=2000, epochs=50,
                 else:
                     policy_loss = -(logp * g_buf[mb_idx]).mean()
                 critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
-                loss = policy_loss + 0.5 * critic_loss - 0.02 * entropy.mean() * (lam ** epoch) 
+                entropy_coef = max(0.02 * (1 - epoch / epochs), 0.0)
+                loss = policy_loss + 0.5 * critic_loss - entropy_coef * entropy.mean()
+                # loss = policy_loss + 0.5 * critic_loss - 0.02 * entropy.mean() * (lam ** epoch) 
 
                 optimizer.zero_grad()
                 loss.backward()
