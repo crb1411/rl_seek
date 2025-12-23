@@ -36,7 +36,12 @@ def run_inference(model_path: str | Path, env_name: str = "CartPole-v1",
     video_dir.mkdir(parents=True, exist_ok=True)
 
     env = gym.make(env_name, render_mode="rgb_array")
-    env = gym.wrappers.RecordVideo(env, video_dir=str(video_dir), name_prefix=name_prefix)
+    env = gym.wrappers.RecordVideo(
+                                env, 
+                                video_folder=str(video_dir), 
+                                name_prefix=name_prefix, 
+                                episode_trigger=lambda x:x%4 == 0
+                            )
 
     if device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -69,3 +74,14 @@ def run_inference(model_path: str | Path, env_name: str = "CartPole-v1",
     env.close()
     avg_reward = total_reward / episodes
     return avg_reward, video_dir
+
+if __name__ == "__main__":
+    checkpoint_path = Path("/data/seek/rl_rundata/logs_ac/ppo_gae_with_clip_20251223_2204/checkpoints/latest.pt")
+    video_dir = checkpoint_path.parent.parent / "videos"
+    run_inference(
+        model_path=checkpoint_path,
+        env_name="CartPole-v1", 
+        episodes=10, 
+        video_dir=video_dir, 
+        name_prefix="eval"
+    )

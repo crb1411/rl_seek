@@ -1,4 +1,5 @@
 import os
+
 import gymnasium as gym
 import torch
 import torch.optim as optim
@@ -12,11 +13,10 @@ from advantage_normalizer import AdvantageNormalizer
 from models import ActorCritic
 from training_utils import init_wandb, save_checkpoint, load_checkpoint
 from inference import evaluate_policy
-from config import TrainingConfig
+from config import TrainingConfig, Advantage_Policy
 from utils import creat_subdir, format_rollout_log_str, format_head_tail, setup_logger
 
 logger = logging.getLogger("rl.training")
-
 
 
 
@@ -51,10 +51,10 @@ class RolloutBuffer:
         self.values[self.ptr] = value
         self.ptr += 1
 
-    def finish_path(self, gamma=0.99, lam=0.95, strategy: str = "advantage"):
+    def finish_path(self, gamma=0.99, lam=0.95, strategy: Advantage_Policy=Advantage_Policy.PPO_GAE):
         """
         Compute G_t and the chosen policy target (G_list).
-        strategy in {"return", "advantage", "td_error", "ppo_gae"} maps to:
+        strategy in Advantage. 0,1,2,3 maps to:
         - return: G_t
         - advantage: G_t - V(s_t)
         - td_error: r_t + gamma * V(s_{t+1}) - V(s_t)
@@ -83,17 +83,17 @@ class RolloutBuffer:
             [self.values[1:n], np.array([0.0], dtype=np.float32)]
         )
 
-        if strategy == "return":
+        if strategy == Advantage_Policy.RETURN:
             g_list = returns
-        elif strategy == "advantage":
+        elif strategy == Advantage_Policy.ADVANTAGE:
             g_list = returns - self.values[:n]
-        elif strategy == "td_error":
+        elif strategy == Advantage_Policy.TD_ERROR:
             g_list = (
                 self.rewards[:n]
                 + gamma * next_values * (1 - self.dones[:n])
                 - self.values[:n]
             )
-        elif strategy == "ppo_gae":
+        elif strategy == Advantage_Policy.PPO_GAE:
             gae = 0.0
             adv = np.zeros(n, dtype=np.float32)
             for i in reversed(range(n)):
@@ -149,14 +149,20 @@ def ppo_train(config: TrainingConfig):
     ac = ActorCritic(obs_dim, act_dim).to(device)
     optimizer = optim.Adam(ac.parameters(), lr=config.pi_lr)
     adv_normalizer = AdvantageNormalizer(momentum=0) # 等于 0 退化成不参考历史的 mean, std
+    policy_name = (
+        config.policy_target.name
+        if isinstance(config.policy_target, Advantage_Policy)
+        else str(config.policy_target)
+    )
     training_config = asdict(config)
+    training_config["policy_target"] = policy_name
     training_config["save_root"] = str(save_root)
     training_config["checkpoint_dir"] = str(checkpoint_dir)
     training_config["resume_path"] = str(resume_path) if resume_path else None
 
-    valid_policy_targets = {"return", "advantage", "td_error", "ppo_gae"}
+    valid_policy_targets = set(Advantage_Policy)
     if config.policy_target not in valid_policy_targets:
-        raise ValueError(f"policy_target must be one of {valid_policy_targets}")
+        raise ValueError(f"policy_target must be one of {list(Advantage_Policy)}")
 
     buf = RolloutBuffer(config.steps_per_epoch + env_max_steps, obs_dim, normalizer=adv_normalizer)
 
@@ -174,7 +180,10 @@ def ppo_train(config: TrainingConfig):
     # =========================
     # Train run
     # =========================
-    base_name = config.run_name or "train"
+    base_name = config.run_name or f"{policy_name}_{'with_clip' if config.use_clip else 'no_clip'}"
+    if config.run_name is None:
+        config.run_name = base_name
+    training_config["run_name"] = base_name
 
     run = init_wandb(
         config.use_wandb,
@@ -185,7 +194,6 @@ def ppo_train(config: TrainingConfig):
         entity=config.wandb_entity,
         project=config.wandb_project,
     )
-
     logger.info(f"[wandb] train run   : {base_name}")
 
     for epoch in range(start_epoch, config.epochs):
@@ -232,7 +240,7 @@ def ppo_train(config: TrainingConfig):
                 "rollout/first_returns": format_head_tail(buf.returns[first_slice].tolist()),
                 "rollout/first_advantages": format_head_tail(buf.advantages[first_slice].tolist()),
             }
-            logger.info(format_rollout_log_str(rollout_log))
+            logger.info(f"\n{format_rollout_log_str(rollout_log)}")
             # run.log(
             #     rollout_log
             # )
@@ -288,7 +296,8 @@ def ppo_train(config: TrainingConfig):
         current_epoch = epoch + 1
         logger.info(
             f"Epoch {current_epoch}: TestReward={test_reward:.1f}\n"
-            f"pi_loss={current_policy_loss:.4f} vf_loss={current_value_loss:.4f} ent={current_entropy:.4f}\n\n"
+            f"pi_loss={current_policy_loss:.4f} vf_loss={current_value_loss:.4f} ent={current_entropy:.4f}\n"
+            f"{"*" * 52}\n"
         )
 
         save_checkpoint(checkpoint_dir / "latest.pt", ac, optimizer, adv_normalizer, epoch, training_config)
@@ -312,24 +321,38 @@ def ppo_train(config: TrainingConfig):
 if __name__ == "__main__":
     train_config = TrainingConfig(
                         epochs=100,
+                        policy_target=Advantage_Policy.RETURN,
                         use_wandb=True,
                         train_iters=10,
                         use_clip=True,
+                        save_root="/data/seek/rl_rundata/logs_ac"
                     )
-    save_root = train_config.save_root if train_config.save_root else "/mnt/seek/rundata/1223"
     
+    save_root = train_config.save_root if train_config.save_root else "/mnt/seek/rundata/1223"
+    policy_str = train_config.policy_target.name if isinstance(train_config.policy_target, Advantage_Policy) else str(train_config.policy_target)
+    prefix = f"{policy_str}_with_clip" if train_config.use_clip else f"{policy_str}_no_clip"
     train_config.save_root = creat_subdir(
                                 base_dir=save_root, 
-                                prefix=f"{TrainingConfig.policy_target}", 
+                                prefix=prefix, 
                                 create=True,
                                 time=True,
                             )
-    train_config.run_name = f"{train_config.policy_target}_with_clip_{train_config.save_root[-9:]}" if train_config.use_clip else f"{train_config.policy_target}_no_clip_{train_config.save_root[-9:]}"
+    suffix = train_config.save_root[-9:] if len(train_config.save_root) >= 9 else train_config.save_root
+    train_config.run_name = (
+        f"{policy_str}_with_clip_{suffix}"
+        if train_config.use_clip
+        else f"{policy_str}_no_clip_{suffix}"
+    )
     train_config.checkpoint_dir = os.path.join(train_config.save_root, "checkpoints")
     logger = setup_logger(name='rl.training', log_dir=train_config.save_root, filename='training.log')
     logger.info(train_config)
-    ppo_train(train_config)   # 可调大epochs训练更好
-    # 推理展示（训练结束后手动调用）
-    # env = gym.make("CartPole-v1", render_mode='human')
-    # ac = ... # 你的模型
-    # evaluate_policy(ac, env, episodes=5, render=True)
+    ppo_train(train_config)     # 训练
+    # 
+    """
+    我发现训练后期模型会忘记坏状态下的策略， 
+    因为考虑如果（极限）优化后期大部分状态都是好的，所以优化到后面，模型会将坏的结果可能也打一个很高的 value，
+    那么此时模型输入一个坏结果，就会干扰到整个模型的训练，让极其不稳定。 
+    这是极限情况，可以说明模型训练不鲁棒，反之如果是最优点的话，不会出现扰动，
+    
+    后续可以针对此，可以记录下一定的坏状态，增加到value的训练中
+    """
