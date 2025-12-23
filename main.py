@@ -50,18 +50,20 @@ class RolloutBuffer:
         self.logprobs = np.zeros(size, np.float32)
         self.rewards = np.zeros(size, np.float32)
         self.dones = np.zeros(size, np.float32)
+        self.timeouts = np.zeros(size, np.float32)
         self.values = np.zeros(size, np.float32)
         self.advantages = np.zeros(size, np.float32)
         self.returns = np.zeros(size, np.float32)
         self.ptr = 0
         self.max_size = size
 
-    def store(self, obs, action, logp, reward, done, value):
+    def store(self, obs, action, logp, reward, done, value, timeout=False):
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = action
         self.logprobs[self.ptr] = logp
         self.rewards[self.ptr] = reward
         self.dones[self.ptr] = done
+        self.timeouts[self.ptr] = float(timeout)
         self.values[self.ptr] = value
         self.ptr += 1
 
@@ -82,7 +84,11 @@ class RolloutBuffer:
         g_next = 0.0
         for i in reversed(range(n)):
             if self.dones[i]:
-                g_next = 0.0
+                if self.timeouts[i]:
+                    g_next = 1.0 / (1.0 - gamma)
+                else:
+                    g_next = 0.0
+
             g_next = self.rewards[i] + gamma * g_next
             returns[i] = g_next
 
@@ -133,10 +139,11 @@ class RolloutBuffer:
         
 
 # --- 3. 训练主循环 ---
-def ppo_train(env_name='CartPole-v1', steps_per_epoch=2048, epochs=50,
+def ppo_train(env_name='CartPole-v1', steps_per_epoch=2000, epochs=50,
               gamma=0.99, lam=0.95, pi_lr=3e-4,
               train_iters=10, batch_size=64, render_test=False,
-              policy_target: str = "advantage"):
+              policy_target: str = "advantage",
+              use_clip: bool = False, clip_ratio: float = 0.2):
 
     env = gym.make(env_name)
     spec = getattr(env, "spec", None)
@@ -168,7 +175,9 @@ def ppo_train(env_name='CartPole-v1', steps_per_epoch=2048, epochs=50,
                     action, logp, value = ac.get_action(obs_tensor)
                 next_obs, reward, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
-                buf.store(obs, action, logp.item(), reward, done, value.item())
+                buf.store(
+                    obs, action, logp.item(), reward, done, value.item(), timeout=truncated
+                )
                 obs = next_obs
                 steps_collected += 1
                 if done:
@@ -176,8 +185,8 @@ def ppo_train(env_name='CartPole-v1', steps_per_epoch=2048, epochs=50,
         # 采样完成，计算G_list
         buf.finish_path(gamma=gamma, lam=lam, strategy=policy_target)
 
-        # 开始训练（使用 -log_prob * G_list）
-        obs_buf, act_buf, _, ret_buf, g_buf = buf.get()
+        # 开始训练（使用 -log_prob * G_list 或 PPO-Clip）
+        obs_buf, act_buf, logp_buf, ret_buf, g_buf = buf.get()
         n = obs_buf.shape[0]
         idx = np.arange(n)
 
@@ -189,9 +198,15 @@ def ppo_train(env_name='CartPole-v1', steps_per_epoch=2048, epochs=50,
                 logp, entropy, values = ac.evaluate_actions(
                     obs_buf[mb_idx], act_buf[mb_idx]
                 )
-                policy_loss = -(logp * g_buf[mb_idx]).mean()
+                if use_clip:
+                    ratio = torch.exp(logp - logp_buf[mb_idx])
+                    unclipped = ratio * g_buf[mb_idx]
+                    clipped = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio) * g_buf[mb_idx]
+                    policy_loss = -torch.min(unclipped, clipped).mean()
+                else:
+                    policy_loss = -(logp * g_buf[mb_idx]).mean()
                 critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
-                loss = policy_loss + 0.5 * critic_loss - 0.01 * entropy.mean()
+                loss = policy_loss + 0.5 * critic_loss - 0.02 * entropy.mean() * (lam ** epoch) 
 
                 optimizer.zero_grad()
                 loss.backward()
