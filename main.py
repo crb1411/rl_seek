@@ -266,14 +266,15 @@ def ppo_train(config: TrainingConfig):
                 logp, entropy, values = ac.evaluate_actions(
                     obs_buf[mb_idx], act_buf[mb_idx]
                 )
+                adv = advantages_buf[mb_idx].detach()
                 if config.use_clip:
                     ratio = torch.exp(logp - logp_buf[mb_idx])
-                    unclipped = ratio * advantages_buf[mb_idx]
-                    clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * advantages_buf[mb_idx]
+                    unclipped = ratio * adv
+                    clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * adv
                     policy_loss = -torch.min(unclipped, clipped).mean()
                     # logger.info(f'ratio: {ratio.mean().item()}')
                 else:
-                    policy_loss = -(logp * advantages_buf[mb_idx]).mean()
+                    policy_loss = -(logp * adv).mean()
                 critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
                 entropy_coef = max(0.02 * (1 - epoch / config.epochs), 0.0)
                 loss = policy_loss + 0.5 * critic_loss - entropy_coef * entropy.mean()
