@@ -10,6 +10,7 @@ class Advantage_Policy(Enum):
     ADVANTAGE = 1
     TD_ERROR = 2
     PPO_GAE = 3
+    ADVANTAGE_DISCOUNTED = 4
     
 @dataclass
 class TrainingConfig:

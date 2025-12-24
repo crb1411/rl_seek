@@ -105,6 +105,13 @@ class RolloutBuffer:
                 gae = delta + gamma * lam * (1 - self.dones[i]) * gae
                 adv[i] = gae
             g_list = adv
+        elif strategy == Advantage_Policy.ADVANTAGE_DISCOUNTED:
+            adv_list = returns - self.values[:n]
+            for i in reversed(range(n)):
+                if i == n - 1:
+                    continue
+                adv_list[i] = adv_list[i] + gamma * lam * adv_list[i + 1] * (1 - self.dones[i])
+            g_list = adv_list
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -322,7 +329,7 @@ def ppo_train(config: TrainingConfig):
 if __name__ == "__main__":
     train_config = TrainingConfig(
                         epochs=100,
-                        policy_target=Advantage_Policy.RETURN,
+                        policy_target=Advantage_Policy.ADVANTAGE_DISCOUNTED,
                         use_wandb=True,
                         train_iters=10,
                         use_clip=True,
