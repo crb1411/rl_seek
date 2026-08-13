@@ -26,7 +26,7 @@ class TrainingConfig:
     batch_size: int = 32
     render_test: bool = False
     policy_target: Advantage_Policy = Advantage_Policy.PPO_GAE
-    use_adv_normalizer: bool = False
+    use_adv_normalizer: bool = True
     use_clip: bool = False
     clip_ratio: float = 0.2
     value_clip_ratio: float = 0.2

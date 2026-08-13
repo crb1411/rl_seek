@@ -30,125 +30,181 @@ class RolloutBuffer:
     def __init__(self, size, obs_dim, normalizer: AdvantageNormalizer | None = None):
         self.obs = np.zeros((size, obs_dim), np.float32)
         self.actions = np.zeros(size, np.int32)
-        self.logprobs = np.zeros(size, np.float32)
+        self.old_log_probs = np.zeros(size, np.float32)
         self.rewards = np.zeros(size, np.float32)
-        self.dones = np.zeros(size, np.float32)
-        self.timeouts = np.zeros(size, np.float32)
-        self.values = np.zeros(size, np.float32)
-        self.next_values = np.zeros(size, np.float32)
+        self.terminated = np.zeros(size, np.float32)
+        self.truncated = np.zeros(size, np.float32)
+        self.old_values = np.zeros(size, np.float32)
+        # Only needed when an episode is cut off by the environment time limit.
+        # For ordinary transitions, V_old(s_{t+1}) is old_values[t + 1].
+        self.timeout_bootstrap_values = np.zeros(size, np.float32)
+        # Unnormalized actor signal, e.g. GAE's A_hat_t.
+        self.raw_advantages = np.zeros(size, np.float32)
+        # Actor signal after optional normalization.
         self.advantages = np.zeros(size, np.float32)
+        # Critic regression target. In standard PPO this is A_hat_t + V_old(s_t).
         self.returns = np.zeros(size, np.float32)
         self.ptr = 0
         self.max_size = size
         self.normalizer = normalizer
 
-    def store(self, obs, action, logp, reward, done, value, next_value=0.0, timeout=False):
+    def store(
+        self,
+        obs,
+        action,
+        old_log_prob,
+        reward,
+        terminated,
+        truncated,
+        old_value,
+        timeout_bootstrap_value=0.0,
+    ):
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = action
-        self.logprobs[self.ptr] = logp
+        self.old_log_probs[self.ptr] = old_log_prob
         self.rewards[self.ptr] = reward
-        self.dones[self.ptr] = done
-        self.timeouts[self.ptr] = float(timeout)
-        self.values[self.ptr] = value
-        self.next_values[self.ptr] = next_value
+        self.terminated[self.ptr] = float(terminated)
+        self.truncated[self.ptr] = float(truncated)
+        self.old_values[self.ptr] = old_value
+        self.timeout_bootstrap_values[self.ptr] = timeout_bootstrap_value
         self.ptr += 1
 
-    def finish_path(self, gamma=0.99, lam=0.95, strategy: Advantage_Policy=Advantage_Policy.PPO_GAE):
-        """
-        Compute G_t and the chosen policy target (G_list).
-        strategy in Advantage. 0,1,2,3 maps to:
-        - return: G_t
-        - advantage: G_t - V(s_t)
-        - td_error: r_t + gamma * V(s_{t+1}) - V(s_t)
-        - ppo_gae: sum_k (gamma*lam)^k * delta_{t+k}, where delta_t is TD error
+    def _next_state_values(self, n: int) -> np.ndarray:
+        """Build V_old(s_{t+1}) without another forward on normal steps."""
+        next_values = np.zeros(n, dtype=np.float32)
+        if n > 1:
+            next_values[:-1] = self.old_values[1:n]
+
+        # old_values[i + 1] after an episode end belongs to the next reset
+        # episode. A pure time-limit truncation instead bootstraps from its
+        # actual next_obs. If both flags are true, termination takes priority.
+        timeout_mask = (
+            self.truncated[:n].astype(bool)
+            & ~self.terminated[:n].astype(bool)
+        )
+        next_values[timeout_mask] = self.timeout_bootstrap_values[:n][timeout_mask]
+        return next_values
+
+    def compute_returns_and_advantages(
+        self,
+        gamma=0.99,
+        lam=0.95,
+        strategy: Advantage_Policy = Advantage_Policy.PPO_GAE,
+    ):
+        """Compute actor advantages and critic returns from one rollout.
+
+        Notation used throughout this method:
+        - ``discounted_returns[t]``: bootstrapped discounted return G_t.
+        - ``td_errors[t]``: one-step Bellman residual delta_t.
+        - ``raw_advantages[t]``: unnormalized actor advantage A_hat_t.
+        - ``self.advantages[t]``: actor advantage after normalization.
+        - ``self.returns[t]``: critic regression target R_t.
+
+        For STANDARD_PPO, A_hat_t is GAE and R_t = A_hat_t + V_old(s_t).
+        Legacy strategies keep using Monte Carlo G_t as the critic target.
         """
         n = self.ptr
         if n == 0:
             return
 
-        returns = np.zeros(n, dtype=np.float32)
-        g_next = 0.0
-        for i in reversed(range(n)):
-            if self.dones[i]:
-                if self.timeouts[i]:
-                    # g_next = 1.0 / (1.0 - gamma)
-                    g_next = (self.values[i] - 1.0) / gamma
-                else:
-                    g_next = 0.0
-
-            g_next = self.rewards[i] + gamma * g_next
-            returns[i] = g_next
-
-        self.returns[:n] = returns
-
-        next_values = np.concatenate(
-            [self.values[1:n], np.array([0.0], dtype=np.float32)]
+        next_values = self._next_state_values(n)
+        episode_ends = np.maximum(
+            self.terminated[:n], self.truncated[:n]
         )
+        bootstrap_mask = 1.0 - self.terminated[:n]
+
+        discounted_returns = np.zeros(n, dtype=np.float32)
+        next_return = 0.0
+        for i in reversed(range(n)):
+            if episode_ends[i]:
+                # A timeout is not a true terminal state, so bootstrap from
+                # V_old(next_obs). A true termination has no future value.
+                is_timeout = self.truncated[i] and not self.terminated[i]
+                next_return = next_values[i] if is_timeout else 0.0
+
+            next_return = self.rewards[i] + gamma * next_return
+            discounted_returns[i] = next_return
+
+        # Unless STANDARD_PPO overrides it below, the critic fits Monte Carlo G_t.
+        self.returns[:n] = discounted_returns
 
         if strategy == Advantage_Policy.RETURN:
-            g_list = returns
+            # Legacy REINFORCE-style actor weight; it is not baseline-centered.
+            raw_advantages = discounted_returns
         elif strategy == Advantage_Policy.ADVANTAGE:
-            g_list = returns - self.values[:n]
+            raw_advantages = discounted_returns - self.old_values[:n]
         elif strategy == Advantage_Policy.TD_ERROR:
-            g_list = (
+            raw_advantages = (
                 self.rewards[:n]
-                + gamma * next_values * (1 - self.dones[:n])
-                - self.values[:n]
+                + gamma * bootstrap_mask * next_values
+                - self.old_values[:n]
             )
         elif strategy == Advantage_Policy.PPO_GAE:
-            gae = 0.0
-            adv = np.zeros(n, dtype=np.float32)
+            next_gae = 0.0
+            raw_advantages = np.zeros(n, dtype=np.float32)
             for i in reversed(range(n)):
-                delta = (
+                td_error = (
                     self.rewards[i]
-                    + gamma * next_values[i] * (1 - self.dones[i])
-                    - self.values[i]
+                    + gamma * bootstrap_mask[i] * next_values[i]
+                    - self.old_values[i]
                 )
-                gae = delta + gamma * lam * (1 - self.dones[i]) * gae
-                adv[i] = gae
-            g_list = adv
+                next_gae = (
+                    td_error
+                    + gamma * lam * (1 - episode_ends[i]) * next_gae
+                )
+                raw_advantages[i] = next_gae
         elif strategy == Advantage_Policy.STANDARD_PPO:
             # Bootstrap through a time-limit truncation, but never let GAE flow
             # into the next reset episode. A true termination has no bootstrap.
-            terminated = self.dones[:n] * (1.0 - self.timeouts[:n])
-            deltas = (
+            td_errors = (
                 self.rewards[:n]
-                + gamma * (1.0 - terminated) * self.next_values[:n]
-                - self.values[:n]
+                + gamma * bootstrap_mask * next_values
+                - self.old_values[:n]
             )
-            gae = 0.0
-            adv = np.zeros(n, dtype=np.float32)
+            next_gae = 0.0
+            raw_advantages = np.zeros(n, dtype=np.float32)
             for i in reversed(range(n)):
-                gae = deltas[i] + gamma * lam * (1.0 - self.dones[i]) * gae
-                adv[i] = gae
+                next_gae = (
+                    td_errors[i]
+                    + gamma * lam * (1.0 - episode_ends[i]) * next_gae
+                )
+                raw_advantages[i] = next_gae
 
-            # The critic target paired with GAE is the lambda-return.
-            self.returns[:n] = adv + self.values[:n]
-            g_list = adv
+            # GAE's matching critic target is the lambda-return R_t.
+            self.returns[:n] = raw_advantages + self.old_values[:n]
         elif strategy == Advantage_Policy.ADVANTAGE_DISCOUNTED:
-            adv_list = returns - self.values[:n]
+            raw_advantages = discounted_returns - self.old_values[:n]
             for i in reversed(range(n)):
                 if i == n - 1:
                     continue
-                adv_list[i] = adv_list[i] + gamma * lam * adv_list[i + 1] * (1 - self.dones[i])
-            g_list = adv_list
+                raw_advantages[i] += (
+                    gamma
+                    * lam
+                    * raw_advantages[i + 1]
+                    * (1 - episode_ends[i])
+                )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
+        self.raw_advantages[:n] = raw_advantages
         if self.normalizer is not None:
-            g_torch = torch.tensor(g_list, dtype=torch.float32)
-            g_list = self.normalizer.normalize(g_torch).cpu().numpy()
+            advantage_tensor = torch.tensor(raw_advantages, dtype=torch.float32)
+            actor_advantages = (
+                self.normalizer.normalize(advantage_tensor).cpu().numpy()
+            )
+        else:
+            actor_advantages = raw_advantages
 
-        self.advantages[:n] = g_list
+        self.advantages[:n] = actor_advantages
 
     def get(self):
         return (
             torch.tensor(self.obs[:self.ptr], dtype=torch.float32),
             torch.tensor(self.actions[:self.ptr], dtype=torch.long),
-            torch.tensor(self.logprobs[:self.ptr], dtype=torch.float32),
+            torch.tensor(self.old_log_probs[:self.ptr], dtype=torch.float32),
             torch.tensor(self.returns[:self.ptr], dtype=torch.float32),
             torch.tensor(self.advantages[:self.ptr], dtype=torch.float32),
-            torch.tensor(self.values[:self.ptr], dtype=torch.float32),
+            torch.tensor(self.old_values[:self.ptr], dtype=torch.float32),
         )
 
     def reset(self):
@@ -176,7 +232,11 @@ def ppo_train(config: TrainingConfig):
     device = select_device(config.device)
     ac = ActorCritic(obs_dim, act_dim).to(device)
     optimizer = optim.Adam(ac.parameters(), lr=config.pi_lr)
-    adv_normalizer = AdvantageNormalizer(momentum=0) # 等于 0 退化成不参考历史的 mean, std
+    adv_normalizer = (
+        AdvantageNormalizer(momentum=0)
+        if config.use_adv_normalizer
+        else None
+    )
     policy_name = (
         config.policy_target.name
         if isinstance(config.policy_target, Advantage_Policy)
@@ -229,41 +289,47 @@ def ppo_train(config: TrainingConfig):
         steps_collected = 0
         while steps_collected < config.steps_per_epoch:
             obs, _ = env.reset()
-            done = False
-            while not done:
+            while True:
                 obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
                 with torch.no_grad():
-                    action, logp, value = ac.get_action(obs_tensor)
+                    action, old_log_prob, old_value = ac.get_action(obs_tensor)
                 next_obs, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                with torch.no_grad():
-                    if terminated:
-                        next_value = 0.0
-                    else:
+                timeout_bootstrap_value = 0.0
+                if truncated and not terminated:
+                    # next_obs will not become the next stored observation
+                    # because the environment is reset after a timeout.
+                    with torch.no_grad():
                         next_obs_tensor = torch.tensor(
                             next_obs, dtype=torch.float32, device=device
                         )
-                        _, next_value_tensor = ac(next_obs_tensor)
-                        next_value = next_value_tensor.item()
+                        timeout_value_tensor = ac.get_value(next_obs_tensor)
+                        timeout_bootstrap_value = timeout_value_tensor.item()
                 buf.store(
                     obs,
                     action,
-                    logp.item(),
+                    old_log_prob.item(),
                     reward,
-                    done,
-                    value.item(),
-                    next_value=next_value,
-                    timeout=truncated,
+                    terminated,
+                    truncated,
+                    old_value.item(),
+                    timeout_bootstrap_value=timeout_bootstrap_value,
                 )
                 obs = next_obs
                 steps_collected += 1
-                if done:
+                if terminated or truncated:
                     break
-        # 采样完成，计算G_list
-        buf.finish_path(gamma=config.gamma, lam=config.lam, strategy=config.policy_target)
+        # Rollout is complete: compute critic returns and actor advantages.
+        buf.compute_returns_and_advantages(
+            gamma=config.gamma,
+            lam=config.lam,
+            strategy=config.policy_target,
+        )
         
         if run is not None:
-            first_done_indices = np.where(buf.dones[:buf.ptr] > 0)[0]
+            episode_ends = np.maximum(
+                buf.terminated[:buf.ptr], buf.truncated[:buf.ptr]
+            )
+            first_done_indices = np.where(episode_ends > 0)[0]
             if first_done_indices.size > 0:
                 first_end = int(first_done_indices[0])
             else:
@@ -272,7 +338,7 @@ def ppo_train(config: TrainingConfig):
             first_slice = slice(0, first_end + 1)
             first_len = first_slice.stop - first_slice.start
 
-            episodes = int(np.count_nonzero(buf.dones[:buf.ptr]))
+            episodes = int(np.count_nonzero(episode_ends))
             episodes = max(episodes, 1)
             rollout_log = {
                 "rollout/epoch": epoch + 1,
@@ -280,21 +346,37 @@ def ppo_train(config: TrainingConfig):
                 "rollout/episodes": episodes,
                 "rollout/avg_steps_per_episode": float(buf.ptr / episodes),
                 "rollout/first_episode_len": int(first_len),
-                "rollout/first_values": format_head_tail(buf.values[first_slice].tolist()),
-                "rollout/first_returns": format_head_tail(buf.returns[first_slice].tolist()),
-                "rollout/first_advantages": format_head_tail(buf.advantages[first_slice].tolist()),
+                "rollout/first_old_values": format_head_tail(
+                    buf.old_values[first_slice].tolist()
+                ),
+                "rollout/first_returns": format_head_tail(
+                    buf.returns[first_slice].tolist()
+                ),
+                "rollout/first_raw_advantages": format_head_tail(
+                    buf.raw_advantages[first_slice].tolist()
+                ),
+                "rollout/first_advantages": format_head_tail(
+                    buf.advantages[first_slice].tolist()
+                ),
             }
             logger.info(f"\n{format_rollout_log_str(rollout_log)}")
             # run.log(
             #     rollout_log
             # )
             
-        # 开始训练（使用 -log_prob * G_list 或 PPO-Clip）
-        obs_buf, act_buf, logp_buf, ret_buf, advantages_buf, old_values_buf = buf.get()
+        # Actor uses advantages; critic regresses toward returns (value targets).
+        (
+            obs_buf,
+            actions_buf,
+            old_log_probs_buf,
+            returns_buf,
+            advantages_buf,
+            old_values_buf,
+        ) = buf.get()
         obs_buf = obs_buf.to(device)
-        act_buf = act_buf.to(device)
-        logp_buf = logp_buf.to(device)
-        ret_buf = ret_buf.to(device)
+        actions_buf = actions_buf.to(device)
+        old_log_probs_buf = old_log_probs_buf.to(device)
+        returns_buf = returns_buf.to(device)
         advantages_buf = advantages_buf.to(device)
         old_values_buf = old_values_buf.to(device)
         n = obs_buf.shape[0]
@@ -308,37 +390,51 @@ def ppo_train(config: TrainingConfig):
             for start in range(0, n, config.batch_size):
                 end = start + config.batch_size
                 mb_idx = idx[start:end]
-                logp, entropy, values = ac.evaluate_actions(
-                    obs_buf[mb_idx], act_buf[mb_idx]
+                new_log_probs, entropy, new_values = ac.evaluate_actions(
+                    obs_buf[mb_idx], actions_buf[mb_idx]
                 )
-                adv = advantages_buf[mb_idx].detach()
+                advantages = advantages_buf[mb_idx].detach()
                 if (
                     config.use_clip
                     or config.policy_target == Advantage_Policy.STANDARD_PPO
                 ):
-                    ratio = torch.exp(logp - logp_buf[mb_idx])
-                    unclipped = ratio * adv
-                    clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * adv
-                    policy_loss = -torch.min(unclipped, clipped).mean()
+                    ratio = torch.exp(
+                        new_log_probs - old_log_probs_buf[mb_idx]
+                    )
+                    surrogate = ratio * advantages
+                    clipped_surrogate = torch.clamp(
+                        ratio,
+                        1 - config.clip_ratio,
+                        1 + config.clip_ratio,
+                    ) * advantages
+                    policy_loss = -torch.minimum(
+                        surrogate, clipped_surrogate
+                    ).mean()
                     # logger.info(f'ratio: {ratio.mean().item()}')
                 else:
-                    policy_loss = -(logp * adv).mean()
+                    policy_loss = -(new_log_probs * advantages).mean()
                 if config.policy_target == Advantage_Policy.STANDARD_PPO:
                     old_values = old_values_buf[mb_idx]
                     values_clipped = old_values + torch.clamp(
-                        values - old_values,
+                        new_values - old_values,
                         -config.value_clip_ratio,
                         config.value_clip_ratio,
                     )
-                    value_loss_unclipped = (values - ret_buf[mb_idx]) ** 2
-                    value_loss_clipped = (values_clipped - ret_buf[mb_idx]) ** 2
+                    value_loss_unclipped = (
+                        new_values - returns_buf[mb_idx]
+                    ) ** 2
+                    value_loss_clipped = (
+                        values_clipped - returns_buf[mb_idx]
+                    ) ** 2
                     critic_loss = torch.maximum(
                         value_loss_unclipped, value_loss_clipped
                     ).mean()
                     entropy_coef = config.entropy_coef
                     value_loss_coef = config.value_loss_coef
                 else:
-                    critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
+                    critic_loss = (
+                        (returns_buf[mb_idx] - new_values) ** 2
+                    ).mean()
                     entropy_coef = max(0.02 * (1 - epoch / config.epochs), 0.0)
                     value_loss_coef = 0.5
 
