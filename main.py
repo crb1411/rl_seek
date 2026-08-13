@@ -35,13 +35,14 @@ class RolloutBuffer:
         self.dones = np.zeros(size, np.float32)
         self.timeouts = np.zeros(size, np.float32)
         self.values = np.zeros(size, np.float32)
+        self.next_values = np.zeros(size, np.float32)
         self.advantages = np.zeros(size, np.float32)
         self.returns = np.zeros(size, np.float32)
         self.ptr = 0
         self.max_size = size
         self.normalizer = normalizer
 
-    def store(self, obs, action, logp, reward, done, value, timeout=False):
+    def store(self, obs, action, logp, reward, done, value, next_value=0.0, timeout=False):
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = action
         self.logprobs[self.ptr] = logp
@@ -49,6 +50,7 @@ class RolloutBuffer:
         self.dones[self.ptr] = done
         self.timeouts[self.ptr] = float(timeout)
         self.values[self.ptr] = value
+        self.next_values[self.ptr] = next_value
         self.ptr += 1
 
     def finish_path(self, gamma=0.99, lam=0.95, strategy: Advantage_Policy=Advantage_Policy.PPO_GAE):
@@ -105,6 +107,24 @@ class RolloutBuffer:
                 gae = delta + gamma * lam * (1 - self.dones[i]) * gae
                 adv[i] = gae
             g_list = adv
+        elif strategy == Advantage_Policy.STANDARD_PPO:
+            # Bootstrap through a time-limit truncation, but never let GAE flow
+            # into the next reset episode. A true termination has no bootstrap.
+            terminated = self.dones[:n] * (1.0 - self.timeouts[:n])
+            deltas = (
+                self.rewards[:n]
+                + gamma * (1.0 - terminated) * self.next_values[:n]
+                - self.values[:n]
+            )
+            gae = 0.0
+            adv = np.zeros(n, dtype=np.float32)
+            for i in reversed(range(n)):
+                gae = deltas[i] + gamma * lam * (1.0 - self.dones[i]) * gae
+                adv[i] = gae
+
+            # The critic target paired with GAE is the lambda-return.
+            self.returns[:n] = adv + self.values[:n]
+            g_list = adv
         elif strategy == Advantage_Policy.ADVANTAGE_DISCOUNTED:
             adv_list = returns - self.values[:n]
             for i in reversed(range(n)):
@@ -128,6 +148,7 @@ class RolloutBuffer:
             torch.tensor(self.logprobs[:self.ptr], dtype=torch.float32),
             torch.tensor(self.returns[:self.ptr], dtype=torch.float32),
             torch.tensor(self.advantages[:self.ptr], dtype=torch.float32),
+            torch.tensor(self.values[:self.ptr], dtype=torch.float32),
         )
 
     def reset(self):
@@ -215,8 +236,24 @@ def ppo_train(config: TrainingConfig):
                     action, logp, value = ac.get_action(obs_tensor)
                 next_obs, reward, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
+                with torch.no_grad():
+                    if terminated:
+                        next_value = 0.0
+                    else:
+                        next_obs_tensor = torch.tensor(
+                            next_obs, dtype=torch.float32, device=device
+                        )
+                        _, next_value_tensor = ac(next_obs_tensor)
+                        next_value = next_value_tensor.item()
                 buf.store(
-                    obs, action, logp.item(), reward, done, value.item(), timeout=truncated
+                    obs,
+                    action,
+                    logp.item(),
+                    reward,
+                    done,
+                    value.item(),
+                    next_value=next_value,
+                    timeout=truncated,
                 )
                 obs = next_obs
                 steps_collected += 1
@@ -253,12 +290,13 @@ def ppo_train(config: TrainingConfig):
             # )
             
         # 开始训练（使用 -log_prob * G_list 或 PPO-Clip）
-        obs_buf, act_buf, logp_buf, ret_buf, advantages_buf = buf.get()
+        obs_buf, act_buf, logp_buf, ret_buf, advantages_buf, old_values_buf = buf.get()
         obs_buf = obs_buf.to(device)
         act_buf = act_buf.to(device)
         logp_buf = logp_buf.to(device)
         ret_buf = ret_buf.to(device)
         advantages_buf = advantages_buf.to(device)
+        old_values_buf = old_values_buf.to(device)
         n = obs_buf.shape[0]
         idx = np.arange(n)
         epoch_policy_losses = []
@@ -274,7 +312,10 @@ def ppo_train(config: TrainingConfig):
                     obs_buf[mb_idx], act_buf[mb_idx]
                 )
                 adv = advantages_buf[mb_idx].detach()
-                if config.use_clip:
+                if (
+                    config.use_clip
+                    or config.policy_target == Advantage_Policy.STANDARD_PPO
+                ):
                     ratio = torch.exp(logp - logp_buf[mb_idx])
                     unclipped = ratio * adv
                     clipped = torch.clamp(ratio, 1 - config.clip_ratio, 1 + config.clip_ratio) * adv
@@ -282,15 +323,38 @@ def ppo_train(config: TrainingConfig):
                     # logger.info(f'ratio: {ratio.mean().item()}')
                 else:
                     policy_loss = -(logp * adv).mean()
-                critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
-                entropy_coef = max(0.02 * (1 - epoch / config.epochs), 0.0)
-                loss = policy_loss + 0.5 * critic_loss - entropy_coef * entropy.mean()
+                if config.policy_target == Advantage_Policy.STANDARD_PPO:
+                    old_values = old_values_buf[mb_idx]
+                    values_clipped = old_values + torch.clamp(
+                        values - old_values,
+                        -config.value_clip_ratio,
+                        config.value_clip_ratio,
+                    )
+                    value_loss_unclipped = (values - ret_buf[mb_idx]) ** 2
+                    value_loss_clipped = (values_clipped - ret_buf[mb_idx]) ** 2
+                    critic_loss = torch.maximum(
+                        value_loss_unclipped, value_loss_clipped
+                    ).mean()
+                    entropy_coef = config.entropy_coef
+                    value_loss_coef = config.value_loss_coef
+                else:
+                    critic_loss = ((ret_buf[mb_idx] - values) ** 2).mean()
+                    entropy_coef = max(0.02 * (1 - epoch / config.epochs), 0.0)
+                    value_loss_coef = 0.5
+
+                loss = (
+                    policy_loss
+                    + value_loss_coef * critic_loss
+                    - entropy_coef * entropy.mean()
+                )
 
                 optimizer.zero_grad()
                 loss.backward()
+                if config.policy_target == Advantage_Policy.STANDARD_PPO:
+                    torch.nn.utils.clip_grad_norm_(ac.parameters(), config.max_grad_norm)
                 optimizer.step()
                 epoch_policy_losses.append(policy_loss.item())
-                epoch_value_losses.append(critic_loss.item() * 0.5)
+                epoch_value_losses.append(critic_loss.item() * value_loss_coef)
                 epoch_entropies.append(entropy.mean().item() * entropy_coef)
 
         # 简单评估（每轮打印一次）
@@ -329,11 +393,11 @@ def ppo_train(config: TrainingConfig):
 if __name__ == "__main__":
     train_config = TrainingConfig(
                         epochs=100,
-                        policy_target=Advantage_Policy.ADVANTAGE_DISCOUNTED,
+                        policy_target=Advantage_Policy.ADVANTAGE,
                         use_wandb=True,
                         train_iters=10,
                         use_clip=True,
-                        save_root="/data/seek/rl_rundata/logs_ac"
+                        save_root="./logs_ac"
                     )
     
     save_root = train_config.save_root if train_config.save_root else "/mnt/seek/rundata/1223"

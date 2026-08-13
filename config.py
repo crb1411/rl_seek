@@ -11,6 +11,8 @@ class Advantage_Policy(Enum):
     TD_ERROR = 2
     PPO_GAE = 3
     ADVANTAGE_DISCOUNTED = 4
+    # Standard PPO: GAE actor advantage + lambda-return critic target.
+    STANDARD_PPO = 5
     
 @dataclass
 class TrainingConfig:
@@ -27,6 +29,10 @@ class TrainingConfig:
     use_adv_normalizer: bool = False
     use_clip: bool = False
     clip_ratio: float = 0.2
+    value_clip_ratio: float = 0.2
+    value_loss_coef: float = 0.5
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
     save_root: str | Path = "/data/seek/rl_rundata/logs_ac"
     checkpoint_dir: str | Path = None
     checkpoint_freq: int = 20

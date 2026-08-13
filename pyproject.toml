@@ -1,0 +1,12 @@
+[project]
+name = "rl-seek"
+version = "0.1.0"
+description = "Reinforcement learning experiments with Gymnasium and PyTorch"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "gymnasium[classic-control]>=1.2.0,<2",
+    "numpy>=2.0,<3",
+    "torch>=2.7,<3",
+    "wandb>=0.21,<1",
+]
+
