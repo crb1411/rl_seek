@@ -140,16 +140,19 @@ class RolloutBuffer:
                 - self.old_values[:n]
             )
         elif strategy == Advantage_Policy.PPO_GAE:
+            # TD errors are independent across transitions, so compute them in
+            # one vectorized operation. GAE itself remains a backward scan
+            # because A_hat_t depends on A_hat_{t+1}.
+            td_errors = (
+                self.rewards[:n]
+                + gamma * bootstrap_mask * next_values
+                - self.old_values[:n]
+            )
             next_gae = 0.0
             raw_advantages = np.zeros(n, dtype=np.float32)
             for i in reversed(range(n)):
-                td_error = (
-                    self.rewards[i]
-                    + gamma * bootstrap_mask[i] * next_values[i]
-                    - self.old_values[i]
-                )
                 next_gae = (
-                    td_error
+                    td_errors[i]
                     + gamma * lam * (1 - episode_ends[i]) * next_gae
                 )
                 raw_advantages[i] = next_gae
