@@ -233,6 +233,7 @@ def ppo_train(config: TrainingConfig):
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.n
     device = select_device(config.device)
+    print(f'device: {device}')
     ac = ActorCritic(obs_dim, act_dim).to(device)
     optimizer = optim.Adam(ac.parameters(), lr=config.pi_lr)
     adv_normalizer = (
@@ -287,7 +288,8 @@ def ppo_train(config: TrainingConfig):
     )
     logger.info(f"[wandb] train run   : {base_name}")
 
-    for epoch in range(start_epoch, config.epochs):
+    def train_one_epoch(epoch: int) -> None:
+        """Collect one rollout, update PPO, evaluate, and save the epoch."""
         buf.reset()
         steps_collected = 0
         while steps_collected < config.steps_per_epoch:
@@ -420,8 +422,8 @@ def ppo_train(config: TrainingConfig):
                     old_values = old_values_buf[mb_idx]
                     values_clipped = old_values + torch.clamp(
                         new_values - old_values,
-                        -config.value_clip_ratio,
-                        config.value_clip_ratio,
+                        -config.value_clip_range,
+                        config.value_clip_range,
                     )
                     value_loss_unclipped = (
                         new_values - returns_buf[mb_idx]
@@ -485,6 +487,9 @@ def ppo_train(config: TrainingConfig):
                 "entropy": current_entropy,
             })
 
+    for epoch in range(start_epoch, config.epochs):
+        train_one_epoch(epoch)
+
     if run is not None:
         run.finish()
 
@@ -492,7 +497,7 @@ def ppo_train(config: TrainingConfig):
 if __name__ == "__main__":
     train_config = TrainingConfig(
                         epochs=100,
-                        policy_target=Advantage_Policy.ADVANTAGE,
+                        policy_target=Advantage_Policy.STANDARD_PPO,
                         use_wandb=True,
                         train_iters=10,
                         use_clip=True,

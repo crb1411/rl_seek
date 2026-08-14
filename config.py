@@ -29,7 +29,7 @@ class TrainingConfig:
     use_adv_normalizer: bool = True
     use_clip: bool = False
     clip_ratio: float = 0.2
-    value_clip_ratio: float = 0.2
+    value_clip_range: float = 0.2
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
