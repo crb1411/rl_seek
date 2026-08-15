@@ -18,7 +18,7 @@ class Advantage_Policy(Enum):
 class TrainingConfig:
     env_name: str = "CartPole-v1"
     # Total transitions across all rollout environments per PPO epoch.
-    steps_per_epoch: int = 8192
+    steps_per_epoch: int = 8000
     # One uses an in-process vector env; values > 1 use subprocess workers.
     num_envs: int = 8
     epochs: int = 100
