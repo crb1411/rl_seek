@@ -29,12 +29,16 @@ class ActorCritic(nn.Module):
         return value.squeeze(-1)
 
     def get_action(self, obs):
+        action, log_prob, value = self.get_actions(obs)
+        return action.item(), log_prob, value
+
+    def get_actions(self, obs):
+        """Sample actions for either one observation or an observation batch."""
         logits, value = self.forward(obs)
-        probs = torch.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
+        dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action.item(), log_prob, value
+        return action, log_prob, value
 
     def evaluate_actions(self, obs, act):
         logits, value = self.forward(obs)

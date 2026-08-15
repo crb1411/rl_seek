@@ -8,6 +8,66 @@ try:
     import torch.distributed as dist
 except Exception:
     dist = None
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+
+
+def path_component(value: str) -> str:
+    """Convert a label into one safe, readable directory component."""
+    component = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-._")
+    if not component:
+        raise ValueError(f"invalid empty path component from {value!r}")
+    return component
+
+
+def resolve_output_root(output_root: str | Path = DEFAULT_OUTPUT_ROOT) -> Path:
+    """Resolve relative output roots against the repository directory."""
+    root = Path(output_root).expanduser()
+    return root if root.is_absolute() else PROJECT_ROOT / root
+
+
+def training_run_dir(
+    *,
+    env_name: str,
+    experiment_name: str,
+    run_name: str,
+    output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    create: bool = False,
+) -> Path:
+    """Return outputs/training/<env>/<experiment>/<run>."""
+    root = resolve_output_root(output_root)
+    path = (
+        root
+        / "training"
+        / path_component(env_name)
+        / path_component(experiment_name)
+        / path_component(run_name)
+    )
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def analysis_run_dir(
+    *,
+    analysis_name: str,
+    run_name: str,
+    output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    create: bool = False,
+) -> Path:
+    """Return outputs/analysis/<analysis>/<run>."""
+    root = resolve_output_root(output_root)
+    path = (
+        root
+        / "analysis"
+        / path_component(analysis_name)
+        / path_component(run_name)
+    )
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
     
 def next_log_dir(base_dir: str, prefix: str = "log", create: bool = False) -> str:
     """

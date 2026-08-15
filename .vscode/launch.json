@@ -2,10 +2,18 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug PPO Training (main.py)",
+            "name": "Debug PPO Training (train.py)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/main.py",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--env-name", "LunarLander-v3",
+                "--no-policy-clip",
+                "--value-clip-range", "0.3",
+                "--device", "cuda:1",
+                "--experiment-name", "LunarLander-no-policy-clip-value-0p3",
+                "--no-wandb"
+            ],
             "python": "${workspaceFolder}/.venv/bin/python",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",

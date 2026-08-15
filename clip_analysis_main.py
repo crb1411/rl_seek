@@ -25,6 +25,7 @@ from config import Advantage_Policy
 from inference import evaluate_policy
 from main import RolloutBuffer
 from models import ActorCritic
+from utils import analysis_run_dir
 
 
 class ActorObjective(str, Enum):
@@ -50,7 +51,7 @@ class ExperimentConfig:
     max_grad_norm: float = 0.5
     eval_episodes: int = 3
     seed: int = 20260814
-    output_root: str = "clip_analysis_results"
+    output_root: str = "outputs"
 
 
 def configure_logger(log_path: Path, mode: ActorObjective) -> logging.Logger:
@@ -466,8 +467,12 @@ def main() -> None:
     )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     ratio_label = f"clip_{config.clip_ratio:.2f}".replace(".", "p")
-    output_dir = Path(config.output_root) / f"{timestamp}_{ratio_label}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = analysis_run_dir(
+        output_root=config.output_root,
+        analysis_name="policy-clip",
+        run_name=f"{timestamp}_{ratio_label}",
+        create=True,
+    )
     (output_dir / "config.json").write_text(
         json.dumps(asdict(config), indent=2, ensure_ascii=False),
         encoding="utf-8",

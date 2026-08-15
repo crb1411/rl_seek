@@ -5,3 +5,4 @@ __pycache__/
 wandb/
 logs_ac
 *_results/
+outputs/

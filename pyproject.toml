@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "Reinforcement learning experiments with Gymnasium and PyTorch"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "gymnasium[classic-control]>=1.2.0,<2",
+    "gymnasium[box2d,classic-control]>=1.2.0,<2",
+    "moviepy>=2.2.1",
     "numpy>=2.0,<3",
+    "swig>=4.4.1",
     "torch==2.11.0+cu128",
     "wandb>=0.21,<1",
 ]

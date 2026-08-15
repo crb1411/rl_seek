@@ -9,7 +9,7 @@ from advantage_normalizer import AdvantageNormalizer
 
 def init_wandb(enable: bool, save_root: Path, config: dict, run_name: Optional[str] = None,
                resume_id: Optional[str] = None, entity: str = "crb_1411",
-               project: str = "seek_rl"):
+               project: str = "seek_rl", group: Optional[str] = None):
     if not enable:
         return None
     try:
@@ -25,6 +25,7 @@ def init_wandb(enable: bool, save_root: Path, config: dict, run_name: Optional[s
         name=run_name,
         id=resume_id,
         resume="allow" if resume_id else None,
+        group=group,
         config=config,
         reinit=True
     )
